@@ -1,0 +1,187 @@
+# Lint on PRs (fail a chart PR unless its version increases, one chart per PR, title "[chart] ...").
+# On push to main: package chart versions not yet published, merge them into the existing
+# index.yaml on gh-pages, and deploy. Published versions are never removed or overwritten.
+# Inspired by: https://helm.sh/docs/howto/chart_releaser_action/ (Chart Releaser is an alternative — see README).
+#
+# After first run: Settings → Pages → Source = branch gh-pages, folder / (root).
+#
+# How this file works (checkout, setup-helm, permissions, GITHUB_TOKEN, vars): docs/02-publish-helm-workflow.md
+
+name: Helm lint and publish
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: helm-publish-${{ github.workflow }}-${{ github.ref }}
+  # Never cancel a publish on main mid-deploy; queued runs merge into whatever is on gh-pages.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Lint all charts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          charts=(charts/*/Chart.yaml)
+          if [ "${#charts[@]}" -eq 0 ] || [ ! -e "${charts[0]}" ]; then
+            echo "No charts found under charts/*/Chart.yaml"
+            exit 1
+          fi
+          for c in "${charts[@]}"; do
+            dir=$(dirname "$c")
+            echo "::group::helm lint $dir"
+            ./scripts/helm-dep-build.sh "$dir"
+            helm lint "$dir"
+            echo "::endgroup::"
+          done
+
+      - name: Require a higher chart version and a [chart] PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          # On pull_request, HEAD is the merge commit; its first parent is the base branch tip.
+          BASE=$(git rev-parse HEAD^1)
+          failed=0
+          changed=()
+          for c in charts/*/Chart.yaml; do
+            dir=$(dirname "$c")
+            if git diff --quiet "$BASE" HEAD -- "$dir"; then
+              continue
+            fi
+            changed+=("$dir")
+            if ! git cat-file -e "$BASE:$c" 2>/dev/null; then
+              echo "$dir: new chart"
+              continue
+            fi
+            old=$(git show "$BASE:$c" | yq -r '.version')
+            new=$(yq -r '.version' "$c")
+            lowest=$(printf '%s\n' "$old" "$new" | sort -V | head -1)
+            if [ "$new" = "$old" ] || [ "$lowest" = "$new" ]; then
+              echo "::error file=$c::$dir changed but version must increase (still $new, was $old)"
+              failed=1
+            else
+              echo "$dir: version $old -> $new"
+            fi
+          done
+
+          # Same pull-request shape as prometheus-community/helm-charts: one chart, title "[chart-name] ...".
+          if [ "${#changed[@]}" -gt 1 ]; then
+            echo "::error::Change one chart per pull request. Changed: ${changed[*]}"
+            failed=1
+          elif [ "${#changed[@]}" -eq 1 ]; then
+            name=$(basename "${changed[0]}")
+            if [[ "$PR_TITLE" != "[${name}] "* ]]; then
+              echo "::error::PR title must start with '[${name}] '"
+              failed=1
+            fi
+          fi
+          exit "$failed"
+
+  publish:
+    name: Package, index, deploy to gh-pages
+    needs: lint
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Fetch currently published repo from gh-pages
+        run: |
+          set -euo pipefail
+          mkdir -p site
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git archive FETCH_HEAD | tar -x -C site
+          else
+            echo "No gh-pages branch yet — first publish."
+          fi
+
+      - name: Package new chart versions and merge index.yaml
+        id: package
+        env:
+          # Default: GitHub Pages project site — https://<owner>.github.io/<repo>/
+          # Optional: set repo variable HELM_PAGES_BASE_URL (e.g. custom Pages domain with trailing slash)
+          DEFAULT_PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+          HELM_PAGES_BASE_URL: ${{ vars.HELM_PAGES_BASE_URL }}
+        run: |
+          set -euo pipefail
+          INDEX_URL="${HELM_PAGES_BASE_URL:-$DEFAULT_PAGES_URL}"
+          shopt -s nullglob
+          charts=(charts/*/Chart.yaml)
+          if [ "${#charts[@]}" -eq 0 ] || [ ! -e "${charts[0]}" ]; then
+            echo "No charts found under charts/"
+            exit 1
+          fi
+
+          mkdir -p new
+          for c in "${charts[@]}"; do
+            dir=$(dirname "$c")
+            name=$(yq '.name' "$c")
+            version=$(yq '.version' "$c")
+            if [ -f "site/${name}-${version}.tgz" ]; then
+              echo "${name} ${version} already published — skipping"
+              continue
+            fi
+            ./scripts/helm-dep-build.sh "$dir"
+            helm package "$dir" --destination new
+          done
+
+          pkgs=(new/*.tgz)
+          if [ "${#pkgs[@]}" -eq 0 ]; then
+            echo "No new chart versions to publish."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Index only the new packages, then merge existing entries so their
+          # created timestamps and digests stay unchanged.
+          echo "helm repo index --url ${INDEX_URL}"
+          if [ -f site/index.yaml ]; then
+            helm repo index new --url "${INDEX_URL}" --merge site/index.yaml
+          else
+            helm repo index new --url "${INDEX_URL}"
+          fi
+          mv new/*.tgz site/
+          mv new/index.yaml site/index.yaml
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to gh-pages
+        if: steps.package.outputs.changed == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          publish_branch: gh-pages
+          keep_files: true
+          force_orphan: false

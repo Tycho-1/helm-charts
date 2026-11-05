@@ -1,0 +1,142 @@
+# Optional: push packaged charts to an OCI registry (e.g. Docker Hub) with helm push.
+# Does not replace publish-helm.yml (GitHub Pages + index.yaml). Enable by adding secrets.
+#
+# Monorepo (many charts under charts/*/):
+#   Use a git tag per release:  <chart name from Chart.yaml>-<version>
+#   Example: Chart name "payments-api", version 2.0.0  →  tag  payments-api-2.0.0
+#   Only that chart is helm push'd (avoids duplicate-tag errors on the other charts).
+#
+# Triggers:
+#   - Tag push (chart-releaser style only): git tag payments-api-2.0.0 && git push origin payments-api-2.0.0
+#     Pattern *-*.*.* — e.g. example-0.1.0. Unrelated tags (v1.0.0, release-notes) do not run this workflow.
+#   - Manual: Actions → "Helm push OCI" → optional "chart" input = folder name (e.g. example) to push one chart;
+#             leave empty to push every chart under charts/*/ (testing only).
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   DOCKERHUB_USERNAME — Docker ID (namespace for oci://docker.io/<user>)
+#   DOCKERHUB_TOKEN    — Docker Hub access token (read/write/delete as needed)
+#
+# Optional variable: DOCKERHUB_NAMESPACE — if set, used instead of DOCKERHUB_USERNAME for the oci:// path
+
+name: Helm push OCI
+
+on:
+  workflow_dispatch:
+    inputs:
+      chart:
+        description: "Folder under charts/ to push only (e.g. example). Empty = push all charts."
+        required: false
+        default: ""
+  push:
+    tags:
+      # <Chart.yaml name>-<semver> (e.g. example-0.1.0, payments-api-2.0.0). Skips v1.0.0-style tags.
+      - "*-*.*.*"
+
+concurrency:
+  group: helm-oci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  push-oci:
+    name: Package and helm push (OCI)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.18.3
+
+      - name: Package and push to Docker Hub
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          OCI_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+          CHART_INPUT: ${{ github.event.inputs.chart }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DOCKER_USER:-}" ] || [ -z "${DOCKER_TOKEN:-}" ]; then
+            echo "Missing secrets: set DOCKERHUB_USERNAME and DOCKERHUB_TOKEN in repo Settings → Secrets."
+            exit 1
+          fi
+          NS="${OCI_NAMESPACE:-$DOCKER_USER}"
+          echo "$DOCKER_TOKEN" | helm registry login docker.io -u "$DOCKER_USER" --password-stdin
+
+          shopt -s nullglob
+          charts=(charts/*/Chart.yaml)
+          if [ "${#charts[@]}" -eq 0 ] || [ ! -e "${charts[0]}" ]; then
+            echo "No charts found under charts/*/Chart.yaml"
+            exit 1
+          fi
+
+          push_one() {
+            local dir="$1"
+            local out pkgs pkg
+            echo "::group::helm package + push $dir"
+            # Fresh dir per chart: the .tgz is named from Chart.yaml (not the folder), and
+            # chart names can be prefixes of each other (app vs app-api).
+            out=$(mktemp -d)
+            ./scripts/helm-dep-build.sh "$dir"
+            helm package "$dir" --destination "$out"
+            pkgs=("$out"/*.tgz)
+            if [ "${#pkgs[@]}" -ne 1 ]; then
+              echo "Expected exactly one package from $dir, got ${#pkgs[@]}"
+              exit 1
+            fi
+            pkg="${pkgs[0]}"
+            echo "Pushing $pkg -> oci://docker.io/${NS}"
+            helm push "$pkg" "oci://docker.io/${NS}"
+            echo "::endgroup::"
+          }
+
+          # Manual run: optional single chart folder
+          if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ -n "${CHART_INPUT:-}" ]; then
+            d="charts/${CHART_INPUT}"
+            if [ ! -f "${d}/Chart.yaml" ]; then
+              echo "No Chart.yaml at charts/${CHART_INPUT}"
+              exit 1
+            fi
+            push_one "$d"
+            exit 0
+          fi
+
+          # Manual run: push all
+          if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
+            echo "workflow_dispatch with empty chart input: pushing all charts"
+            for c in "${charts[@]}"; do
+              push_one "$(dirname "$c")"
+            done
+            exit 0
+          fi
+
+          # Tag push: must match exactly one chart's name-version from Chart.yaml
+          TAG="${GITHUB_REF_NAME}"
+          MATCH_DIR=""
+          for c in "${charts[@]}"; do
+            dir=$(dirname "$c")
+            meta=$(helm show chart "$dir")
+            n=$(echo "$meta" | grep -E '^name:' | head -1 | cut -d ':' -f2- | xargs)
+            v=$(echo "$meta" | grep -E '^version:' | head -1 | cut -d ':' -f2- | xargs)
+            if [ "${n}-${v}" = "$TAG" ]; then
+              if [ -n "$MATCH_DIR" ]; then
+                echo "Tag $TAG matches more than one chart — fix Chart.yaml names/versions."
+                exit 1
+              fi
+              MATCH_DIR="$dir"
+            fi
+          done
+
+          if [ -z "$MATCH_DIR" ]; then
+            echo "No chart matches git tag \"$TAG\"."
+            echo "Use a tag of the form <name>-<version> where name and version come from that chart's Chart.yaml"
+            echo "(same idea as chart-releaser). Example: payments-api-2.0.0"
+            exit 1
+          fi
+
+          echo "Tag $TAG matches chart in $MATCH_DIR — pushing only this chart."
+          push_one "$MATCH_DIR"

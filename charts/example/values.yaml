@@ -1,0 +1,3 @@
+# Default values for example — edit and bump Chart.yaml version when you release.
+
+message: "Hello from example chart"

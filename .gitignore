@@ -1,0 +1,11 @@
+# Produced by `helm package` — do not commit unless you intentionally store .tgz in git
+*.tgz
+
+# Local staging for `helm repo index`: same folder gets index.yaml + chart .tgz — do not commit on main
+# (CI in this repo builds an ephemeral `site/` dir and pushes to gh-pages, not to main.)
+publish/
+publish-charts-dir/
+site/
+
+# Scratch output (e.g. test runs of scripts/new-chart-from-starter.sh)
+tmp/

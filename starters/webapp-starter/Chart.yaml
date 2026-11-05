@@ -1,0 +1,6 @@
+apiVersion: v2
+name: webapp-starter
+description: Starter web application chart (Helm create baseline + Ingress, Gateway API HTTPRoute, ConfigMap, Secret, ExternalSecret, optional Istio sidecar settings, PVC, HPA, ServiceAccount).
+type: application
+version: 0.1.0
+appVersion: "1.0"

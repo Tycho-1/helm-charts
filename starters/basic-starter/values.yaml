@@ -1,0 +1,84 @@
+# Minimal defaults: Deployment + Service + optional ConfigMap / Secret (envFrom).
+# Copy: cp -r starters/basic-starter charts/<app>  or  helm create <app> -p …/starters/basic-starter
+
+replicaCount: 1
+
+# nginx is only a stand-in so a fresh chart runs. Set repository and tag to your app.
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  # Service port (what other pods call). May differ from containerPort.
+  port: 80
+  # Port the process listens on inside the container (e.g. 8080).
+  containerPort: 80
+  # Named port on the container and Service. Probe httpGet.port must use this same name.
+  # Istio: http-, https-, grpc-, or tcp- prefix.
+  portName: http
+
+# Optional app ConfigMap — keys become env vars via envFrom when enabled.
+configMap:
+  enabled: false
+  name: ""
+  data: {}
+
+# Optional Opaque Secret — stringData keys become env vars via envFrom when enabled.
+secret:
+  enabled: false
+  name: ""
+  stringData: {}
+
+# Set requests (and limits) for your app. Leave empty only while sketching the chart.
+resources: {}
+
+# Defaults match the nginx stand-in: HTTP GET / on service.portName.
+# Replace httpGet (path, or grpc / tcpSocket / exec) for your app. Set a probe to {} to omit it.
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+# Use when the process is slow to open its port. Empty omits it.
+startupProbe: {}
+
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+istio:
+  enabled: false
+  sidecarInjectAnnotation: "true"
+  revision: ""
+  podAnnotations: {}

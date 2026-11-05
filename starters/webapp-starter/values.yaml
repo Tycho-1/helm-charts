@@ -1,0 +1,191 @@
+# Default values for webapp-starter (Helm `helm create` baseline + web app extras).
+# Copy: cp -r starters/webapp-starter charts/<your-app> && edit Chart.yaml name/version.
+
+replicaCount: 1
+
+# nginx is only a stand-in so a fresh chart runs. Set repository and tag to your app.
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  # false = do not mount the Kubernetes API token unless the app calls the API (smaller blast radius).
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+# Aligns with common Pod Security Standard / Kyverno-style checks (drop caps, no priv esc, seccomp).
+# Tighten further per image: runAsNonRoot, readOnlyRootFilesystem (often needs emptyDir for tmp/cache).
+podSecurityContext:
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  # Service port (what other pods call). May differ from containerPort.
+  port: 80
+  # Port the process listens on inside the container (e.g. 8080).
+  containerPort: 80
+  # Named port on the container and Service. Probe httpGet.port must use this same name.
+  # Istio: http-, https-, grpc-, or tcp- prefix.
+  portName: http
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Gateway API (HTTPRoute). Requires gateway.networking.k8s.io CRDs and a Gateway in the cluster.
+# Does not create a Gateway object — attach to an existing Gateway via parentRefs.
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs:
+    - name: example-gateway
+      namespace: default
+      sectionName: http
+  hostnames:
+    - app.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      # backendRefs default to this chart's Service; override if you need a different backend
+
+# Set requests.cpu before autoscaling.enabled. Memory request is required if you set targetMemoryUtilizationPercentage.
+resources: {}
+
+# Defaults match the nginx stand-in: HTTP GET / on service.portName.
+# Replace httpGet (path, or grpc / tcpSocket / exec) for your app. Set a probe to {} to omit it.
+livenessProbe:
+  httpGet:
+    path: /
+    port: http
+readinessProbe:
+  httpGet:
+    path: /
+    port: http
+# Use when the process is slow to open its port. Empty omits it.
+startupProbe: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# Optional app ConfigMap (e.g. config files). Mounted or envFrom when enabled.
+configMap:
+  enabled: false
+  name: ""
+  annotations: {}
+  data: {}
+  # Example:
+  # data:
+  #   app.properties: |
+  #     key=value
+
+# Optional Opaque Secret for app credentials (envFrom). Prefer External Secrets (below) in production.
+secret:
+  enabled: false
+  name: ""
+  annotations: {}
+  stringData: {}
+  # Example:
+  # stringData:
+  #   API_KEY: "replace-me"
+
+# External Secrets Operator: syncs remote refs into a Kubernetes Secret, then same envFrom as static secret.
+# Requires https://external-secrets.io/ CRDs and a SecretStore or ClusterSecretStore in the cluster.
+# Set secret.enabled: false unless you use a different secret name (static vs ESO target).
+# Changing externalSecret.data or dataFrom rolls the Deployment. A value updated only in the secret store does not.
+externalSecret:
+  enabled: false
+  apiVersion: external-secrets.io/v1beta1
+  refreshInterval: 1h
+  annotations: {}
+  secretStoreRef:
+    name: ""
+    kind: SecretStore
+  target:
+    name: ""
+    creationPolicy: Owner
+    # template: {}  # optional — see https://external-secrets.io/latest/api/externalsecret/
+  data: []
+  # Example (vault/AWS/GCP/etc. keys depend on your SecretStore):
+  # data:
+  #   - secretKey: API_KEY
+  #     remoteRef:
+  #       key: prod/myapp
+  #       property: api_key
+  dataFrom: []
+  # Example: import all keys from a remote secret
+  # dataFrom:
+  #   - extract:
+  #       key: prod/myapp
+
+# Optional PVC + volume mount for persistent data (e.g. uploads, cache).
+persistence:
+  enabled: false
+  annotations: {}
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 8Gi
+  mountPath: /data
+
+# Additional volumes / volumeMounts (e.g. extra secrets, emptyDir)
+volumes: []
+volumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Istio service mesh (sidecar injection). Ambient / waypoint meshes use different labels — see README.
+istio:
+  enabled: false
+  # Adds sidecar.istio.io/inject. Use "false" to opt out in a namespace with default injection; "" omits the annotation.
+  sidecarInjectAnnotation: "true"
+  # Revision label for canary control planes (e.g. "1-20-0"). Empty = omit istio.io/rev on the Pod.
+  revision: ""
+  # Extra Pod annotations (e.g. proxy.istio.io/config, proxy CPU/memory).
+  podAnnotations: {}
+  # Example:
+  # podAnnotations:
+  #   proxy.istio.io/config: '{ "holdApplicationUntilProxyStarts": true }'
+
+# NetworkPolicy: default off — enabling without rules breaks traffic. See README for a DNS + ingress example.
+networkPolicy:
+  enabled: false
+  ingress: []
+  egress: []
+
+# Use when you run more than one replica (or HPA). Prevents voluntary evictions from taking all pods.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
